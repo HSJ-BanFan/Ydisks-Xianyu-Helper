@@ -417,21 +417,29 @@ func (a *Account) startWSRecorder(ctx context.Context) {
 	a.recorder.start(ctx)
 }
 
-// handleWSConnectFailure 封装handleWSConnectFailure业务协调。
+// handleWSConnectFailure 处理 WebSocket 握手或注册失败：
+// 认证类错误置 RuntimeAuthExpired 并退出运行循环；瞬时网络错误置 RuntimeReconnecting 并返回 nil 允许重试。
 func (a *Account) handleWSConnectFailure(ctx context.Context, err error) error {
 	a.clearConnectionToken(ctx)
 	// reason 用于本次流程后续判断的原因
 	reason := "消息凭证被拒绝，请重新登录"
 	if ws.IsConnectLimitError(err) {
 		reason = "消息会话已被服务端移除"
-	} else if !ws.IsInvalidTokenError(err) && !ws.IsAuthenticationError(err) {
-		// 原生握手 CONNECT_FAILED 和 INVALID_TOKEN 一样进入官网 CONN_ERROR=5；
-		// /im 页面不会对该状态自动 reConnect，而是展示重新登录入口。
-		reason = "消息服务连接失败，请重新登录"
+		a.setRuntimeState(RuntimeAuthExpired, reason)
+		a.notifyOffline(ctx, reason)
+		return err
 	}
-	a.setRuntimeState(RuntimeAuthExpired, reason)
-	a.notifyOffline(ctx, reason)
-	return err
+	if ws.IsInvalidTokenError(err) || ws.IsAuthenticationError(err) {
+		a.setRuntimeState(RuntimeAuthExpired, reason)
+		a.notifyOffline(ctx, reason)
+		return err
+	}
+
+	// 传输层/瞬时网络错误（拨号超时、DNS解析失败等）：
+	// 置 RuntimeReconnecting 状态，不置凭证失效，返回 nil 允许主循环退避重试自愈。
+	reason = "消息服务连接失败，正在重试"
+	a.setRuntimeState(RuntimeReconnecting, reason)
+	return nil
 }
 
 // acquireFreshConnectionToken mirrors the official web message client:

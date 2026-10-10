@@ -433,10 +433,8 @@ func TestRun_ConnectsAndDispatchesMessage(t *testing.T) {
 	}
 }
 
-// TestRun_DialFailureRequiresRelogin mirrors the web page: native
-// CONNECT_FAILED enters CONN_ERROR and does not auto-reconnect.
-// TestRun_DialFailureRequiresRelogin 封装Test运行DialFailureRequiresRelogin业务协调。
-func TestRun_DialFailureRequiresRelogin(t *testing.T) {
+// TestRun_DialFailureRetries 验证拨号遇到瞬时网络错误时保持在重连态并自动重试，不会误判为凭证过期终止。
+func TestRun_DialFailureRetries(t *testing.T) {
 	// acc、cleanup 用于本次流程后续判断的acc、cleanup
 	acc, _, _, cleanup := newRunAccount(t, &fakeRunMtop{token: "tok-1"})
 	defer cleanup()
@@ -444,21 +442,40 @@ func TestRun_DialFailureRequiresRelogin(t *testing.T) {
 	// 拨号始终失败。
 	acc.wsDialer = &fakeDialer{results: []dialResult{{err: errFakeDial}}}
 
+	// ctx、cancel 是测试使用的可取消上下文及取消函数。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// runDone 用于本次流程后续判断的运行Done
 	runDone := make(chan error, 1)
-	go func() { runDone <- acc.Run(context.Background()) }()
-	select {
-	case // err 用于本次流程后续判断的err
-	err := <-runDone:
-		if !errors.Is(err, errFakeDial) {
-			t.Fatalf("Run error=%v，期望拨号错误", err)
+	go func() { runDone <- acc.Run(ctx) }()
+
+	// deadline 是等待账号进入重连态的超时截止时间。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		// currentStatus 保存当前轮询读取到的运行时状态。
+		currentStatus := acc.RuntimeStatus()
+		if currentStatus.State == RuntimeReconnecting {
+			break
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("拨号失败后 Run 未退出")
+		time.Sleep(10 * time.Millisecond)
 	}
-	if // status 用于本次流程后续判断的状态
-	status := acc.RuntimeStatus(); status.State != RuntimeAuthExpired {
-		t.Fatalf("runtime state=%q，期望 %q", status.State, RuntimeAuthExpired)
+
+	// finalStatus 保存用于断言重试状态的最终快照。
+	finalStatus := acc.RuntimeStatus()
+	if finalStatus.State != RuntimeReconnecting {
+		t.Fatalf("runtime state=%q，期望 %q", finalStatus.State, RuntimeReconnecting)
+	}
+
+	cancel()
+	select {
+	case // exitErr 是主循环响应取消退出后的最终错误。
+	exitErr := <-runDone:
+		if exitErr != nil && !errors.Is(exitErr, context.Canceled) {
+			t.Fatalf("取消后退出错误不符合预期: %v", exitErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ctx 取消后 Run 未退出")
 	}
 }
 
